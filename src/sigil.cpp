@@ -1,7 +1,7 @@
 #include "sigil.hpp"
 #include <cfgtk/lexer.hpp>
 #include <cfgtk/parser.hpp>
-#include <climits>
+#include <chrono>
 #include <filesystem>
 #include <query.hpp>
 #include <shader.hpp>
@@ -42,6 +42,10 @@ int main(int c, char **v) {
   }
   l = logger{ctx.log_level};
 
+  auto start = std::chrono::steady_clock::now();
+  std::array<std::size_t, 100> frame_times{};
+  std::size_t index{};
+
   while (glfwWindowShouldClose(ctx.window.handle) != GLFW_TRUE) {
     glfwPollEvents();
 
@@ -49,36 +53,61 @@ int main(int c, char **v) {
       l.loge("Rendering failed\n");
       return 2;
     }
+
+    auto end = std::chrono::steady_clock::now();
+    using tu = std::chrono::nanoseconds;
+    frame_times[index] = std::chrono::duration_cast<tu>(end - start).count();
+
+    start = end;
+    index = (index + 1) % frame_times.size();
   }
 
+  std::size_t average_fps{}, offset{5};
+  for (std::size_t i = offset; i < frame_times.size() - offset; ++i)
+    average_fps += frame_times[i];
+  average_fps /= (frame_times.size() - 2 * offset);
+
+  std::cout << "AVG FPS: " << (1.0 / (average_fps / 1'000'000'000.0)) << "\n";
   return 0;
 }
 
 namespace {
-bool render(context *c) {
+bool submit(context *c, uint32_t frame_index, uint32_t image_index) {
   logger l{c->log_level};
+  const VkFence f = c->per_frame[frame_index].presentation_done.handle;
+  const VkCommandBuffer rb = c->per_frame[frame_index].graphics_buffer;
+  VkSubmitInfo sinfo{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  VkPipelineStageFlags wait_stages[] = {
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+  sinfo.waitSemaphoreCount = 1;
+  sinfo.pWaitSemaphores = &c->per_frame[frame_index].image_available.handle;
+  sinfo.pWaitDstStageMask = wait_stages;
+  sinfo.commandBufferCount = 1;
+  sinfo.pCommandBuffers = &rb;
+  sinfo.signalSemaphoreCount = 1;
+  sinfo.pSignalSemaphores = &c->per_frame[frame_index].rendering_done.handle;
 
-  const VkSemaphore ia = c->image_available.handle;
-  const VkSwapchainKHR chain = c->swapchain.handle;
-  const VkDevice dev = c->device.handle;
-
-  // constexpr static auto timeout = std::numeric_limits<unsigned>::max();
-  auto r = vkWaitForFences(dev, 1, &c->prev_frame_fence.handle, VK_TRUE, 0);
-  if (r == VK_TIMEOUT)
-    return true;
-  vkResetFences(dev, 1, &c->prev_frame_fence.handle);
-
-  uint32_t image_index{};
-  r = vkAcquireNextImageKHR(dev, chain, 0, ia, 0, &image_index);
-  if (r != VK_SUCCESS) {
-    if (r == VK_NOT_READY)
-      return true;
-
-    l.loge("Failed to acquire an image from the swapchain\n");
+  if (vkQueueSubmit(c->graphics_queue, 1, &sinfo, f) != VK_SUCCESS) {
+    l.loge("Failed to submit commands to graphics queue\n");
     return false;
   }
 
-  const VkCommandBuffer rb = c->graphics_command_buffers[image_index];
+  return true;
+}
+
+void present(context *c, uint32_t frame_index, uint32_t image_index) {
+  VkPresentInfoKHR pinfo{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+  pinfo.waitSemaphoreCount = 1;
+  pinfo.pWaitSemaphores = &c->per_frame[frame_index].rendering_done.handle;
+  pinfo.pSwapchains = &c->swapchain.handle;
+  pinfo.swapchainCount = 1;
+  pinfo.pImageIndices = &image_index;
+  vkQueuePresentKHR(c->presentation_queue, &pinfo);
+}
+
+bool record(context *c, uint32_t frame_index, uint32_t image_index) {
+  logger l{c->log_level};
+  const VkCommandBuffer rb = c->per_frame[frame_index].graphics_buffer;
   vkResetCommandBuffer(rb, 0);
 
   VkCommandBufferBeginInfo cb_begin_info{
@@ -132,34 +161,41 @@ bool render(context *c) {
     return false;
   }
 
-  VkSubmitInfo sinfo{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  VkSemaphore wait_sem[] = {c->image_available.handle};
-  VkPipelineStageFlags wait_stages[] = {
-      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-  sinfo.waitSemaphoreCount = 1;
-  sinfo.pWaitSemaphores = wait_sem;
-  sinfo.pWaitDstStageMask = wait_stages;
-  sinfo.commandBufferCount = 1;
-  sinfo.pCommandBuffers = &rb;
-  VkSemaphore signal_sem[] = {c->rendering_done.handle};
-  sinfo.signalSemaphoreCount = 1;
-  sinfo.pSignalSemaphores = signal_sem;
+  return true;
+}
 
-  const VkFence f = c->prev_frame_fence.handle;
-  if (vkQueueSubmit(c->graphics_queue, 1, &sinfo, f) != VK_SUCCESS) {
-    l.loge("Failed to submit commands to graphics queue\n");
+bool render(context *c) {
+  const VkSemaphore ia = c->per_frame[c->frame_index].image_available.handle;
+  const VkFence f = c->per_frame[c->frame_index].presentation_done.handle;
+  const VkSwapchainKHR chain = c->swapchain.handle;
+  const VkDevice dev = c->device.handle;
+  logger l{c->log_level};
+
+  auto r = vkWaitForFences(dev, 1, &f, VK_TRUE, 0);
+  if (r == VK_TIMEOUT)
+    return true;
+
+  uint32_t image_index{};
+  r = vkAcquireNextImageKHR(dev, chain, 0, ia, 0, &image_index);
+  if (r != VK_SUCCESS) {
+    if (r == VK_NOT_READY)
+      return true;
+
+    l.loge("Failed to acquire an image from the swapchain\n");
     return false;
   }
 
-  VkPresentInfoKHR pinfo{.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
-  pinfo.waitSemaphoreCount = 1;
-  pinfo.pWaitSemaphores = signal_sem;
-  VkSwapchainKHR chains[] = {c->swapchain.handle};
-  pinfo.pSwapchains = chains;
-  pinfo.swapchainCount = 1;
-  pinfo.pImageIndices = &image_index;
+  vkResetFences(dev, 1, &f);
 
-  vkQueuePresentKHR(c->presentation_queue, &pinfo);
+  if (!record(c, c->frame_index, image_index))
+    return false;
+
+  if (!submit(c, c->frame_index, image_index))
+    return false;
+
+  present(c, c->frame_index, image_index);
+
+  c->frame_index = (c->frame_index + 1) % c->concurrent_frames;
   return true;
 }
 
@@ -688,6 +724,7 @@ bool create_window(context *c) {
   logger l{c->log_level};
 
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+  glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
   GLFWwindow *handle{};
   handle = glfwCreateWindow(c->window_width, c->window_height, "Sigil", 0, 0);
 
@@ -728,39 +765,51 @@ bool create_surface(context *c) {
   return true;
 }
 
-bool create_semaphores(context *c) {
-  logger l{c->log_level};
+bool create_semaphore(VkSemaphore *handle, const VkDevice device) {
+  logger l{logger::err};
 
   VkSemaphoreCreateInfo info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-  const VkDevice device = c->device.handle;
-  VkSemaphore handle{};
+  auto r = vkCreateSemaphore(device, &info, 0, handle);
 
-  auto r = vkCreateSemaphore(c->device.handle, &info, 0, &handle);
   if (r != VK_SUCCESS) {
     l.loge("Failed to create image available sempaphore with code: " +
            std::to_string(r));
     return false;
   }
-  c->image_available = raii::resource<adapter::vk_semaphore>{device, handle};
 
-  r = vkCreateSemaphore(device, &info, 0, &handle);
-  if (r != VK_SUCCESS) {
-    l.loge("Failed to create rendering done sempaphore with code: " +
-           std::to_string(r));
-    return false;
-  }
-  c->rendering_done = raii::resource<adapter::vk_semaphore>{device, handle};
+  return true;
+  ;
+}
 
+bool create_semaphores(context *c) {
   VkFenceCreateInfo finf{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   finf.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+  const VkDevice device = c->device.handle;
+  logger l{c->log_level};
+  VkSemaphore handle{};
   VkFence fence{};
-  r = vkCreateFence(device, &finf, nullptr, &fence);
-  if (r != VK_SUCCESS) {
-    l.loge("Failed to create fence with code: " + std::to_string(r));
-    return false;
+
+  for (std::size_t i = 0; i < c->concurrent_frames; ++i) {
+    if (!create_semaphore(&handle, device))
+      return false;
+    c->per_frame[i].image_available =
+        raii::resource<adapter::vk_semaphore>{device, handle};
+
+    if (!create_semaphore(&handle, device))
+      return false;
+    c->per_frame[i].rendering_done =
+        raii::resource<adapter::vk_semaphore>{device, handle};
+
+    auto r = vkCreateFence(device, &finf, nullptr, &fence);
+    if (r != VK_SUCCESS) {
+      l.loge("Failed to create fence with code: " + std::to_string(r));
+      return false;
+    }
+    c->per_frame[i].presentation_done =
+        raii::resource<adapter::vk_fence>{device, fence};
   }
 
-  c->prev_frame_fence = raii::resource<adapter::vk_fence>{device, fence};
   return true;
 }
 
@@ -795,32 +844,32 @@ bool create_command_buffers(context *c) {
   c->graphics_command_pool =
       raii::resource<adapter::vk_command_pool>{device, handle};
 
+  std::vector<VkCommandBuffer> pbuffers(c->concurrent_frames);
   VkCommandBufferAllocateInfo cbinfo{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  cbinfo.commandBufferCount = c->images.size();
+  cbinfo.commandBufferCount = c->concurrent_frames;
   cbinfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 
-  c->presentation_command_buffers.resize(c->images.size());
   cbinfo.commandPool = c->presentation_command_pool.handle;
-  r = vkAllocateCommandBuffers(device, &cbinfo,
-                               c->presentation_command_buffers.data());
-
+  r = vkAllocateCommandBuffers(device, &cbinfo, pbuffers.data());
   if (r != VK_SUCCESS) {
     auto code = std::to_string(r);
     l.loge("Failed to allocate command buffers with code: " + code);
     return false;
   }
+  for (std::size_t i = 0; i < c->concurrent_frames; ++i)
+    c->per_frame[i].presentation_buffer = pbuffers[i];
 
-  c->graphics_command_buffers.resize(c->images.size());
+  std::vector<VkCommandBuffer> gbuffers(c->concurrent_frames);
   cbinfo.commandPool = c->graphics_command_pool.handle;
-  r = vkAllocateCommandBuffers(device, &cbinfo,
-                               c->graphics_command_buffers.data());
-
+  r = vkAllocateCommandBuffers(device, &cbinfo, gbuffers.data());
   if (r != VK_SUCCESS) {
     auto code = std::to_string(r);
     l.loge("Failed to allocate command buffers with code: " + code);
     return false;
   }
+  for (std::size_t i = 0; i < c->concurrent_frames; ++i)
+    c->per_frame[i].graphics_buffer = gbuffers[i];
 
   return true;
 }

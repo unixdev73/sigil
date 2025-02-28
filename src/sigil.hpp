@@ -1,10 +1,19 @@
 #pragma once
 
+#include <array>
 #include <glfw_adapter.hpp>
 #include <iostream>
 #include <resource.hpp>
 #include <specs.hpp>
 #include <vk_adapter.hpp>
+
+struct frame_objects {
+  VkCommandBuffer presentation_buffer{};
+  VkCommandBuffer graphics_buffer{};
+  raii::resource<adapter::vk_semaphore> image_available{};
+  raii::resource<adapter::vk_semaphore> rendering_done{};
+  raii::resource<adapter::vk_fence> presentation_done{};
+};
 
 struct context {
   context() = default;
@@ -14,6 +23,7 @@ struct context {
   context &operator=(context &&) = default;
   ~context() { vkDeviceWaitIdle(device.handle); }
 
+  static constexpr uint32_t concurrent_frames{2};
   uint32_t window_width{1280}, window_height{720};
   bool debug{false}, help{false};
   std::size_t log_level{};
@@ -40,15 +50,10 @@ struct context {
   std::vector<raii::resource<adapter::vk_image_view>> image_views{};
   std::vector<raii::resource<adapter::vk_framebuffer>> framebuffers{};
 
-  raii::resource<adapter::vk_semaphore> rendering_done{};
-  raii::resource<adapter::vk_semaphore> image_available{};
-  raii::resource<adapter::vk_fence> prev_frame_fence{};
-
   raii::resource<adapter::vk_command_pool> presentation_command_pool{};
-  std::vector<VkCommandBuffer> presentation_command_buffers{};
-
   raii::resource<adapter::vk_command_pool> graphics_command_pool{};
-  std::vector<VkCommandBuffer> graphics_command_buffers{};
+  std::array<frame_objects, concurrent_frames> per_frame{};
+  std::size_t frame_index{};
 
   raii::resource<adapter::vk_render_pass> render_pass{};
   raii::resource<adapter::vk_pipeline_layout> layout{};

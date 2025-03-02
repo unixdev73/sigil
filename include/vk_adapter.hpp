@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
 
 namespace adapter {
@@ -15,6 +16,32 @@ struct vk_device {
   vk_device(VkDevice h) : handle{h} {}
   VkDevice handle{};
   void destroy() { vkDestroyDevice(handle, nullptr); }
+};
+
+struct vk_memory_allocator {
+  vk_memory_allocator() = default;
+  vk_memory_allocator(VmaAllocator h) : handle{h} {}
+  VmaAllocator handle{};
+  void destroy() { vmaDestroyAllocator(handle); }
+};
+
+struct vk_buffer {
+  vk_buffer() = default;
+  vk_buffer(VkDevice d, VkBuffer h) : device{d}, handle{h} {}
+  VkDevice device{};
+  VkBuffer handle{};
+  void destroy() { vkDestroyBuffer(device, handle, nullptr); }
+};
+
+struct vma_buffer {
+  vma_buffer() = default;
+  vma_buffer(VmaAllocator a0, VmaAllocation a, VkBuffer h)
+      : allocator{a0}, allocation{a}, handle{h} {}
+
+  VmaAllocator allocator{};
+  VkBuffer handle{};
+  VmaAllocation allocation{};
+  void destroy() { vmaDestroyBuffer(allocator, handle, allocation); }
 };
 
 struct vk_surface {

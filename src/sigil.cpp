@@ -2,8 +2,10 @@
 #include <cfgtk/lexer.hpp>
 #include <cfgtk/parser.hpp>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <query.hpp>
+#include <random>
 #include <shader.hpp>
 
 namespace fs = std::filesystem;
@@ -15,6 +17,7 @@ bool initialize_glfw(context *c);
 bool create_instance(context *c);
 bool select_physical(context *c);
 bool create_device(context *c);
+bool create_memory_allocator(context *c);
 bool create_window(context *c);
 bool create_surface(context *c);
 bool create_swapchain(context *c);
@@ -24,12 +27,14 @@ bool create_render_pass(context *c);
 bool create_pipeline(context *c);
 bool create_semaphores(context *c);
 bool create_command_buffers(context *c);
+bool create_vertex_buffer(context *c);
 
 bool is_available(const std::vector<VkExtensionProperties> *,
                   const std::string &);
 bool is_available(const std::vector<VkLayerProperties> *, const std::string &);
 
 bool render(context *c);
+bool update(context *c);
 } // namespace
 
 int main(int c, char **v) {
@@ -48,6 +53,11 @@ int main(int c, char **v) {
 
   while (glfwWindowShouldClose(ctx.window.handle) != GLFW_TRUE) {
     glfwPollEvents();
+
+    if (!update(&ctx)) {
+      l.loge("Updating failed\n");
+      return 2;
+    }
 
     if (!render(&ctx)) {
       l.loge("Rendering failed\n");
@@ -72,6 +82,30 @@ int main(int c, char **v) {
 }
 
 namespace {
+inline std::size_t make_random(std::size_t begin, std::size_t end) {
+  static thread_local std::mt19937 rng{std::random_device{}()};
+  return begin + rng() % end;
+}
+
+bool update(context *c) {
+  logger l{c->log_level};
+
+  if (c->update_vertex_buffer) {
+    vkDeviceWaitIdle(c->device.handle);
+    create_vertex_buffer(c);
+    if (vmaCopyMemoryToAllocation(c->allocator.handle, c->vertices.data(),
+                                  c->vertex_buffer.allocation, 0,
+                                  c->vertex_buffer_create_info.size) !=
+        VK_SUCCESS) {
+      l.loge("Failed to copy vertices to buffer!\n");
+      return false;
+    }
+    c->update_vertex_buffer = false;
+  }
+
+  return true;
+}
+
 bool submit(context *c, uint32_t frame_index, uint32_t image_index) {
   logger l{c->log_level};
   const VkFence f = c->per_frame[frame_index].presentation_done.handle;
@@ -135,6 +169,9 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
   vkCmdBeginRenderPass(rb, &rp_begin_info, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(rb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipeline.handle);
 
+  VkDeviceSize offset{0};
+  vkCmdBindVertexBuffers(rb, 0, 1, &c->vertex_buffer.handle, &offset);
+
   VkViewport viewport{};
   viewport.width = (float)c->window_width;
   viewport.height = (float)c->window_height;
@@ -149,7 +186,7 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
   scissor.offset = {0, 0};
   vkCmdSetScissor(rb, 0, 1, &scissor);
 
-  const uint32_t vertex_count{3};
+  const uint32_t vertex_count = c->vertices.size();
   const uint32_t instance_count{1};
   const uint32_t first_vertex{0};
   const uint32_t first_instance{0};
@@ -230,6 +267,11 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
+  if (!create_memory_allocator(c)) {
+    l.loge("VMA allocator creation failed\n");
+    return false;
+  }
+
   if (!create_window(c)) {
     l.loge("Window creation failed\n");
     return false;
@@ -275,6 +317,44 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
+  c->vertices = {{{0.0f, -0.5f, 0.f}, {1.0f, 0.0f, 0.0f, 1.f}},
+                 {{0.5f, 0.5f, 0.f}, {0.0f, 1.0f, 0.0f, 1.f}},
+                 {{-0.5f, 0.5f, 0.f}, {0.0f, 0.0f, 1.0f, 1.f}}};
+  c->update_vertex_buffer = true;
+  return true;
+}
+
+bool create_vertex_buffer(context *c) {
+  auto &vb = c->vertex_buffer_create_info;
+  auto a0 = c->allocator.handle;
+  logger l{c->log_level};
+
+  const auto element_size = sizeof(decltype(c->vertices)::value_type);
+  const auto current_size = c->vertices.size() * element_size;
+
+  if (current_size <= vb.size)
+    return true;
+
+  vb.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  vb.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  vb.size = current_size;
+  vb.usage =
+      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+  VmaAllocationCreateInfo aci{};
+  VkBuffer buff{};
+  VmaAllocation alloc{};
+  VmaAllocationInfo ai{};
+
+  aci.usage = VMA_MEMORY_USAGE_AUTO;
+  aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+
+  if (vmaCreateBuffer(a0, &vb, &aci, &buff, &alloc, &ai) != VK_SUCCESS) {
+    l.loge("Failed to create vk buffer using VMA\n");
+    return false;
+  }
+
+  c->vertex_buffer = raii::resource<adapter::vma_buffer>{a0, alloc, buff};
   return true;
 }
 
@@ -398,21 +478,11 @@ bool conf_dynamic_state(VkPipelineDynamicStateCreateInfo *info,
   return true;
 }
 
-bool conf_vertex_input_info(VkPipelineVertexInputStateCreateInfo *info) {
-  info->sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-  info->vertexBindingDescriptionCount = 0;
-  info->pVertexBindingDescriptions = nullptr; // Optional
-  info->vertexAttributeDescriptionCount = 0;
-  info->pVertexAttributeDescriptions = nullptr; // Optional
-
-  return true;
-}
-
 bool conf_assembly(VkPipelineInputAssemblyStateCreateInfo *a,
                    VkPipelineRasterizationStateCreateInfo *r,
                    VkPipelineMultisampleStateCreateInfo *m) {
   a->sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  a->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  a->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
   a->primitiveRestartEnable = VK_FALSE;
 
   r->sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -475,6 +545,22 @@ bool create_layout(const VkDevice dev, VkPipelineLayout *layout) {
   return true;
 }
 
+bool conf_vertex_input_info(VkPipelineVertexInputStateCreateInfo *info,
+                            VkVertexInputBindingDescription *binding_desc,
+                            const vertex::attr_desc_t *attrib_desc) {
+
+  binding_desc->binding = 0;
+  binding_desc->stride = sizeof(vertex);
+  binding_desc->inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+  info->sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  info->vertexBindingDescriptionCount = 1;
+  info->pVertexBindingDescriptions = binding_desc;
+  info->vertexAttributeDescriptionCount = attrib_desc->size();
+  info->pVertexAttributeDescriptions = attrib_desc->data();
+  return true;
+}
+
 bool create_pipeline(context *c) {
   logger l{c->log_level};
 
@@ -500,7 +586,9 @@ bool create_pipeline(context *c) {
                      &viewport, &scissor, c->window_width, c->window_height);
 
   VkPipelineVertexInputStateCreateInfo vertex_input{};
-  conf_vertex_input_info(&vertex_input);
+  auto attrib_desc = vertex::attribute_description();
+  VkVertexInputBindingDescription vbd{};
+  conf_vertex_input_info(&vertex_input, &vbd, &attrib_desc);
 
   VkPipelineInputAssemblyStateCreateInfo input_assembly{};
   VkPipelineRasterizationStateCreateInfo rasterizer{};
@@ -903,6 +991,21 @@ void assign_queue_family_indices(context *c) {
       break;
     }
   }
+}
+
+bool create_memory_allocator(context *c) {
+  VmaAllocatorCreateInfo info{};
+  info.vulkanApiVersion = c->app_info.apiVersion;
+  info.physicalDevice = c->selected_device;
+  info.instance = c->instance.handle;
+  info.device = c->device.handle;
+
+  VmaAllocator handle{};
+  if (vmaCreateAllocator(&info, &handle) != VK_SUCCESS)
+    return false;
+
+  c->allocator = raii::resource<adapter::vk_memory_allocator>{handle};
+  return true;
 }
 
 bool create_device(context *c) {

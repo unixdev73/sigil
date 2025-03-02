@@ -2,6 +2,7 @@
 
 #include <array>
 #include <glfw_adapter.hpp>
+#include <glm/glm.hpp>
 #include <iostream>
 #include <resource.hpp>
 #include <specs.hpp>
@@ -13,6 +14,26 @@ struct frame_objects {
   raii::resource<adapter::vk_semaphore> image_available{};
   raii::resource<adapter::vk_semaphore> rendering_done{};
   raii::resource<adapter::vk_fence> presentation_done{};
+};
+
+struct vertex {
+  glm::vec3 position{};
+  glm::vec4 color{};
+
+  using attr_desc_t = std::array<VkVertexInputAttributeDescription, 2>;
+  static attr_desc_t attribute_description() {
+    attr_desc_t desc{};
+    desc[0].binding = 0;
+    desc[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    desc[0].location = 0;
+    desc[0].offset = 0;
+
+    desc[1].binding = 0;
+    desc[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    desc[1].location = 1;
+    desc[1].offset = sizeof(vertex::position);
+    return desc;
+  }
 };
 
 struct context {
@@ -40,6 +61,7 @@ struct context {
   uint32_t graphics_queue_family_index{};
   VkQueue presentation_queue{};
   VkQueue graphics_queue{};
+  raii::resource<adapter::vk_memory_allocator> allocator{};
 
   raii::resource<adapter::glfw_window> window{};
   raii::resource<adapter::vk_surface> surface{};
@@ -50,14 +72,19 @@ struct context {
   std::vector<raii::resource<adapter::vk_image_view>> image_views{};
   std::vector<raii::resource<adapter::vk_framebuffer>> framebuffers{};
 
+  raii::resource<adapter::vk_render_pass> render_pass{};
+  raii::resource<adapter::vk_pipeline_layout> layout{};
+  raii::resource<adapter::vk_pipeline> pipeline{};
+
   raii::resource<adapter::vk_command_pool> presentation_command_pool{};
   raii::resource<adapter::vk_command_pool> graphics_command_pool{};
   std::array<frame_objects, concurrent_frames> per_frame{};
   std::size_t frame_index{};
 
-  raii::resource<adapter::vk_render_pass> render_pass{};
-  raii::resource<adapter::vk_pipeline_layout> layout{};
-  raii::resource<adapter::vk_pipeline> pipeline{};
+  VkBufferCreateInfo vertex_buffer_create_info{};
+  raii::resource<adapter::vma_buffer> vertex_buffer{};
+  std::vector<vertex> vertices{};
+  bool update_vertex_buffer{false};
 };
 
 class logger {

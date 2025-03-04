@@ -7,7 +7,6 @@
 #include <query.hpp>
 #include <random>
 #include <shader.hpp>
-#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -23,6 +22,7 @@ bool create_window(context *c);
 bool create_surface(context *c);
 bool create_swapchain(context *c);
 bool create_image_views(context *c);
+bool create_depth_images(context *c);
 bool create_framebuffers(context *c);
 bool create_render_pass(context *c);
 bool create_descriptor_pool(context* c);
@@ -35,6 +35,10 @@ bool update_buffers(context *c);
 bool is_available(const std::vector<VkExtensionProperties> *,
                   const std::string &);
 bool is_available(const std::vector<VkLayerProperties> *, const std::string &);
+
+bool find_supported_format(const std::vector<VkFormat> &candidates,
+                           const VkPhysicalDevice dev, VkImageTiling tiling,
+                           VkFormatFeatureFlags features, VkFormat *out);
 
 bool render(context *c);
 bool update(context *c);
@@ -85,9 +89,129 @@ int main(int c, char **v) {
 }
 
 namespace {
+bool find_supported_format(const std::vector<VkFormat> &candidates,
+                           const VkPhysicalDevice dev, VkImageTiling tiling,
+                           VkFormatFeatureFlags features, VkFormat *out) {
+
+  for (VkFormat format : candidates) {
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(dev, format, &props);
+
+    if (tiling == VK_IMAGE_TILING_LINEAR &&
+        (props.linearTilingFeatures & features) == features) {
+      *out = format;
+      return true;
+    } else if (tiling == VK_IMAGE_TILING_OPTIMAL &&
+               (props.optimalTilingFeatures & features) == features) {
+      *out = format;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool create_depth_images(context *c) {
+  logger l{c->log_level};
+  if (!find_supported_format(
+          {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+           VK_FORMAT_D24_UNORM_S8_UINT},
+          c->selected_device, VK_IMAGE_TILING_OPTIMAL,
+          VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, &c->depth_format)) {
+    l.loge("Failed to find depth attachment format!\n");
+    return false;
+  }
+
+  VkImageCreateInfo info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  info.imageType = VK_IMAGE_TYPE_2D;
+  info.arrayLayers = 1;
+  info.extent = {c->window_width, c->window_height, 1};
+  info.format = c->depth_format;
+  info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  info.mipLevels = 1;
+  info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  info.samples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkImageViewCreateInfo vinf{.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vinf.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vinf.format = c->depth_format;
+  vinf.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vinf.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vinf.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vinf.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vinf.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+  vinf.subresourceRange.baseArrayLayer = 0;
+  vinf.subresourceRange.baseMipLevel = 0;
+  vinf.subresourceRange.layerCount = 1;
+  vinf.subresourceRange.levelCount = 1;
+
+  c->depth_images.resize(c->images.size());
+  c->depth_views.resize(c->images.size());
+  const auto a0 = c->allocator.handle;
+  const VkDevice dev = c->device.handle;
+
+  for (std::size_t i = 0; i < c->depth_images.size(); ++i) {
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO;
+    aci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    aci.priority = 1.f;
+    VmaAllocation alloc{};
+
+    VkImageView img_view{};
+    VkImage img{};
+    if (vmaCreateImage(a0, &info, &aci, &img, &alloc, 0) != VK_SUCCESS) {
+      l.loge("Failed to create depth image\n");
+      return false;
+    }
+    c->depth_images[i] = raii::resource<adapter::vma_image>{a0, alloc, img};
+
+    vinf.image = c->depth_images[i].handle;
+    auto r = vkCreateImageView(dev, &vinf, nullptr, &img_view);
+    if (r != VK_SUCCESS) {
+      l.loge("Failed to create depth view\n");
+      return false;
+    }
+    c->depth_views[i] = raii::resource<adapter::vk_image_view>{dev, img_view};
+  }
+
+  return true;
+}
+
 inline std::size_t make_random(std::size_t begin, std::size_t end) {
   static thread_local std::mt19937 rng{std::random_device{}()};
   return begin + rng() % end;
+}
+
+void update_view(context *c) {
+  static auto stamp = std::chrono::steady_clock::now();
+  auto n = std::chrono::steady_clock::now();
+  auto dif = std::chrono::duration_cast<std::chrono::milliseconds>(n - stamp);
+  if (dif.count() >= 100)
+    stamp = n;
+  else
+    return;
+
+  if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT) == GLFW_PRESS &&
+      glfwGetKey(c->window.handle, GLFW_KEY_X) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, 0.2f, glm::vec3(1.f, 0.f, 0.f));
+    c->update_buffers = true;
+  }
+
+  else if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT) == GLFW_PRESS &&
+           glfwGetKey(c->window.handle, GLFW_KEY_Y) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, 0.2f, glm::vec3(0.f, 1.f, 0.f));
+    c->update_buffers = true;
+  }
+
+  else if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT) == GLFW_PRESS &&
+           glfwGetKey(c->window.handle, GLFW_KEY_Z) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, 0.2f, glm::vec3(0.f, 0.f, 1.f));
+    c->update_buffers = true;
+  }
 }
 
 bool update(context *c) {
@@ -136,20 +260,8 @@ bool update(context *c) {
     c->update_buffers = false;
   }
 
-	static auto stamp = std::chrono::steady_clock::now();
-	if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT)) {
-		auto n = std::chrono::steady_clock::now();
-		auto dif = std::chrono::duration_cast<std::chrono::milliseconds>(n - stamp);
-		if (dif.count() >= 100)
-			stamp = n;
-		else return true;
-
-		c->matrices.model =
-			glm::rotate(c->matrices.model, 0.2f, glm::vec3(1.f, 0.f, 0.f));
-		c->update_buffers = true;
-	}
-
-	return true;
+  update_view(c);
+  return true;
 }
 
 bool submit(context *c, uint32_t frame_index, uint32_t image_index) {
@@ -204,13 +316,12 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
   rp_begin_info.renderArea.extent = {c->window_width, c->window_height};
   rp_begin_info.renderArea.offset = {0, 0};
 
-  VkClearValue clear_value{};
-  clear_value.color.float32[0] = 0.f;
-  clear_value.color.float32[1] = 0.f;
-  clear_value.color.float32[2] = 0.f;
-  clear_value.color.float32[3] = 1.f;
-  rp_begin_info.pClearValues = &clear_value;
-  rp_begin_info.clearValueCount = 1;
+  VkClearValue clear_values[2];
+  clear_values[1].depthStencil = {.depth = 1.f, .stencil = 0};
+  clear_values[0].color = {0.f, 0.f, 0.f, 1.f};
+  rp_begin_info.pClearValues = clear_values;
+  rp_begin_info.clearValueCount =
+      sizeof(clear_values) / sizeof(clear_values[0]);
 
   vkCmdBeginRenderPass(rb, &rp_begin_info, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(rb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipeline.handle);
@@ -338,6 +449,11 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
+  if (!create_depth_images(c)) {
+    l.loge("Depth image creation failed\n");
+    return false;
+  }
+
   if (!create_render_pass(c)) {
     l.loge("Render pass creation failed\n");
     return false;
@@ -436,7 +552,8 @@ bool create_framebuffers(context *c) {
   info.layers = 1;
 
   for (std::size_t i = 0; i < c->images.size(); ++i) {
-    VkImageView attachments[] = {c->image_views[i].handle};
+    VkImageView attachments[] = {c->image_views[i].handle,
+                                 c->depth_views[i].handle};
 
     info.attachmentCount = sizeof(attachments) / sizeof(attachments[0]);
     info.pAttachments = attachments;
@@ -547,21 +664,17 @@ bool conf_assembly(VkPipelineInputAssemblyStateCreateInfo *a,
                    VkPipelineRasterizationStateCreateInfo *r,
                    VkPipelineMultisampleStateCreateInfo *m) {
   a->sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  a->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+  a->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
   a->primitiveRestartEnable = VK_FALSE;
 
   r->sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-  r->depthClampEnable = VK_FALSE;
+  r->depthClampEnable = VK_TRUE;
   r->rasterizerDiscardEnable = VK_FALSE;
   r->polygonMode = VK_POLYGON_MODE_FILL;
   r->lineWidth = 1.0f;
-  r->cullMode = VK_CULL_MODE_BACK_BIT;
-  r->frontFace = VK_FRONT_FACE_CLOCKWISE;
+  r->cullMode = VK_CULL_MODE_NONE;
   r->depthBiasEnable = VK_FALSE;
-  r->depthBiasConstantFactor = 0.0f; // Optional
-  r->depthBiasClamp = 0.0f;          // Optional
-  r->depthBiasSlopeFactor = 0.0f;    // Optional
-                                     //
+
   m->sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
   m->sampleShadingEnable = VK_FALSE;
   m->rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
@@ -577,13 +690,13 @@ bool conf_color(VkPipelineColorBlendAttachmentState *state,
   state->colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
   state->blendEnable = VK_TRUE;
-  state->srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;           // Optional
-  state->dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA; // Optional
-  state->colorBlendOp = VK_BLEND_OP_ADD;             // Optional
-  state->srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;  // Optional
-  state->dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
-  state->alphaBlendOp = VK_BLEND_OP_ADD;             // Optional
-                                                     //
+  state->srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  state->dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  state->colorBlendOp = VK_BLEND_OP_ADD;
+  state->srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  state->dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+  state->alphaBlendOp = VK_BLEND_OP_ADD;
+
   blend->sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
   blend->logicOpEnable = VK_FALSE;
   blend->logicOp = VK_LOGIC_OP_COPY; // Optional
@@ -725,6 +838,12 @@ bool create_pipeline(context *c) {
   VkPipelineColorBlendStateCreateInfo color_blending{};
   conf_color(&color_attachment, &color_blending);
 
+  VkPipelineDepthStencilStateCreateInfo depth{};
+  depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  depth.depthTestEnable = VK_TRUE;
+  depth.depthWriteEnable = VK_TRUE;
+  depth.depthCompareOp = VK_COMPARE_OP_LESS;
+
   VkGraphicsPipelineCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   info.stageCount = sizeof(shader_stages) / sizeof(shader_stages[0]);
@@ -739,6 +858,7 @@ bool create_pipeline(context *c) {
   info.pMultisampleState = &multisampling;
   info.pColorBlendState = &color_blending;
   info.pDynamicState = &dynamic_state;
+  info.pDepthStencilState = &depth;
 
   VkPipeline handle{};
   auto r = vkCreateGraphicsPipelines(c->device.handle, 0, 1, &info, 0, &handle);
@@ -762,27 +882,47 @@ bool create_render_pass(context *c) {
   attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
+  VkAttachmentDescription depth{};
+  depth.format = c->depth_format;
+  depth.samples = VK_SAMPLE_COUNT_1_BIT;
+  depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
   VkAttachmentReference attachment_ref{};
   attachment_ref.attachment = 0;
   attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkAttachmentReference depth_ref{};
+  depth_ref.attachment = 1;
+  depth_ref.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
   VkSubpassDescription subpass{};
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.colorAttachmentCount = 1;
   subpass.pColorAttachments = &attachment_ref;
+  subpass.pDepthStencilAttachment = &depth_ref;
 
   VkSubpassDependency dependency{};
   dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
   dependency.dstSubpass = 0;
-  dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
   dependency.srcAccessMask = 0;
-  dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+  dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+  dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
   VkRenderPassCreateInfo info{};
   info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  info.attachmentCount = 1;
-  info.pAttachments = &attachment;
+  VkAttachmentDescription descs[] = {attachment, depth};
+  info.attachmentCount = sizeof(descs) / sizeof(descs[0]);
+  info.pAttachments = descs;
   info.subpassCount = 1;
   info.pSubpasses = &subpass;
   info.dependencyCount = 1;
@@ -1189,6 +1329,9 @@ bool create_device(context *c) {
   static constexpr const char *swpx = "VK_KHR_swapchain";
   info.ppEnabledExtensionNames = &swpx;
   info.enabledExtensionCount = 1;
+  VkPhysicalDeviceFeatures features{};
+  features.depthClamp = VK_TRUE;
+  info.pEnabledFeatures = &features;
 
   VkDevice handle{VK_NULL_HANDLE};
   auto r = vkCreateDevice(c->selected_device, &info, 0, &handle);
@@ -1369,7 +1512,6 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   const cfg::action_t d = [c, &debug_count](auto *, auto *, auto *) {
     c->debug = true;
     ++debug_count;
-		std::cout << "debugging enabled" << std::endl;
   };
 
   const cfg::action_t w = [c, &width_count](auto *, auto *, auto *s) {

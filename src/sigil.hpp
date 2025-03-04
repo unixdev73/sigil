@@ -79,6 +79,9 @@ struct context {
   VkSurfaceFormatKHR surface_format{};
   std::vector<VkImage> images{};
   std::vector<raii::resource<adapter::vk_image_view>> image_views{};
+  std::vector<raii::resource<adapter::vma_image>> depth_images{};
+  std::vector<raii::resource<adapter::vk_image_view>> depth_views{};
+  VkFormat depth_format{};
   std::vector<raii::resource<adapter::vk_framebuffer>> framebuffers{};
 
   raii::resource<adapter::vk_render_pass> render_pass{};

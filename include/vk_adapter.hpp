@@ -84,6 +84,17 @@ struct vk_image {
   void destroy() { vkDestroyImage(device, handle, nullptr); }
 };
 
+struct vma_image {
+  vma_image() = default;
+  vma_image(VmaAllocator a0, VmaAllocation a, VkImage h)
+      : allocator{a0}, allocation{a}, handle{h} {}
+
+  VmaAllocator allocator{};
+  VkImage handle{};
+  VmaAllocation allocation{};
+  void destroy() { vmaDestroyImage(allocator, handle, allocation); }
+};
+
 struct vk_image_view {
   vk_image_view() = default;
   vk_image_view(VkDevice d, VkImageView h) : device{d}, handle{h} {}

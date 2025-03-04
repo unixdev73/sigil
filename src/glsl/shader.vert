@@ -8,11 +8,9 @@ layout(set = 0, binding = 0) uniform transformation {
 	mat4 model;
 	mat4 view;
 	mat4 projection;
-} matrix;
+} m;
 
 void main() {
-	mat4 mv = matrix.model * matrix.view;
-	mat4 mvp = mv * matrix.projection;
-	gl_Position = mvp * vec4(position, 1.0);
+	gl_Position = m.projection * m.view * m.model * vec4(position, 1.0);
 	frag_in = color;
 }

@@ -139,4 +139,21 @@ struct vk_fence {
   VkFence handle{};
   void destroy() { vkDestroyFence(device, handle, nullptr); }
 };
+
+struct vk_descriptor_pool {
+  vk_descriptor_pool() = default;
+  vk_descriptor_pool(VkDevice d, VkDescriptorPool h) : device{d}, handle{h} {}
+  VkDevice device{};
+  VkDescriptorPool handle{};
+  void destroy() { vkDestroyDescriptorPool(device, handle, nullptr); }
+};
+
+struct vk_descriptor_set_layout {
+  vk_descriptor_set_layout() = default;
+  vk_descriptor_set_layout(VkDevice d, VkDescriptorSetLayout h) :
+		device{d}, handle{h} {}
+  VkDevice device{};
+  VkDescriptorSetLayout handle{};
+  void destroy() { vkDestroyDescriptorSetLayout(device, handle, nullptr); }
+};
 } // namespace adapter

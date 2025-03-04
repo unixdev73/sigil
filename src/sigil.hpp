@@ -2,6 +2,7 @@
 
 #include <array>
 #include <glfw_adapter.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/glm.hpp>
 #include <iostream>
 #include <resource.hpp>
@@ -14,6 +15,8 @@ struct frame_objects {
   raii::resource<adapter::vk_semaphore> image_available{};
   raii::resource<adapter::vk_semaphore> rendering_done{};
   raii::resource<adapter::vk_fence> presentation_done{};
+	VkDescriptorSet descriptor_set{};
+	raii::resource<adapter::vma_buffer> desc_buffer{};
 };
 
 struct vertex {
@@ -34,6 +37,12 @@ struct vertex {
     desc[1].offset = sizeof(vertex::position);
     return desc;
   }
+};
+
+struct transformation {
+	glm::mat4 model{1.f};
+	glm::mat4 view{1.f};
+	glm::mat4 projection{1.f};
 };
 
 struct context {
@@ -73,18 +82,22 @@ struct context {
   std::vector<raii::resource<adapter::vk_framebuffer>> framebuffers{};
 
   raii::resource<adapter::vk_render_pass> render_pass{};
+  raii::resource<adapter::vk_command_pool> presentation_command_pool{};
+  raii::resource<adapter::vk_command_pool> graphics_command_pool{};
+	raii::resource<adapter::vk_descriptor_pool> desc_pool{};
+	raii::resource<adapter::vk_descriptor_set_layout> desc_layout{};
+  std::array<frame_objects, concurrent_frames> per_frame{};
   raii::resource<adapter::vk_pipeline_layout> layout{};
   raii::resource<adapter::vk_pipeline> pipeline{};
 
-  raii::resource<adapter::vk_command_pool> presentation_command_pool{};
-  raii::resource<adapter::vk_command_pool> graphics_command_pool{};
-  std::array<frame_objects, concurrent_frames> per_frame{};
-  std::size_t frame_index{};
-
   VkBufferCreateInfo vertex_buffer_create_info{};
   raii::resource<adapter::vma_buffer> vertex_buffer{};
+  raii::resource<adapter::vma_buffer> index_buffer{};
   std::vector<vertex> vertices{};
-  bool update_vertex_buffer{false};
+	std::vector<uint32_t> indices{};
+	transformation matrices{};
+  bool update_buffers{false};
+  std::size_t frame_index{};
 };
 
 class logger {

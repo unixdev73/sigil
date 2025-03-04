@@ -7,6 +7,7 @@
 #include <query.hpp>
 #include <random>
 #include <shader.hpp>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -24,10 +25,12 @@ bool create_swapchain(context *c);
 bool create_image_views(context *c);
 bool create_framebuffers(context *c);
 bool create_render_pass(context *c);
+bool create_descriptor_pool(context* c);
+bool create_pipeline_layout(context* c);
 bool create_pipeline(context *c);
 bool create_semaphores(context *c);
-bool create_command_buffers(context *c);
-bool create_vertex_buffer(context *c);
+bool create_buffers(context *c);
+bool update_buffers(context *c);
 
 bool is_available(const std::vector<VkExtensionProperties> *,
                   const std::string &);
@@ -89,10 +92,9 @@ inline std::size_t make_random(std::size_t begin, std::size_t end) {
 
 bool update(context *c) {
   logger l{c->log_level};
-
-  if (c->update_vertex_buffer) {
+  if (c->update_buffers) {
     vkDeviceWaitIdle(c->device.handle);
-    create_vertex_buffer(c);
+    update_buffers(c);
     if (vmaCopyMemoryToAllocation(c->allocator.handle, c->vertices.data(),
                                   c->vertex_buffer.allocation, 0,
                                   c->vertex_buffer_create_info.size) !=
@@ -100,10 +102,54 @@ bool update(context *c) {
       l.loge("Failed to copy vertices to buffer!\n");
       return false;
     }
-    c->update_vertex_buffer = false;
+
+    if (vmaCopyMemoryToAllocation(c->allocator.handle, c->indices.data(),
+                                  c->index_buffer.allocation, 0,
+					sizeof(decltype(c->indices)::value_type) * c->indices.size()) !=
+        VK_SUCCESS) {
+      l.loge("Failed to copy indices to buffer!\n");
+      return false;
+    }
+
+		for (std::size_t i = 0; i < c->concurrent_frames; ++i) {
+			if (vmaCopyMemoryToAllocation(c->allocator.handle, &c->matrices,
+										c->per_frame[i].desc_buffer.allocation, 0,
+						sizeof(transformation)) != VK_SUCCESS) {
+				l.loge("Failed to copy matrices to buffer!\n");
+				return false;
+			}
+
+			VkDescriptorBufferInfo dbi{.buffer = c->per_frame[i].desc_buffer.handle};
+			dbi.offset = 0;
+			dbi.range = VK_WHOLE_SIZE;
+
+			VkWriteDescriptorSet wds{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+			wds.descriptorCount = 1;
+			wds.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+			wds.pBufferInfo = &dbi;
+			wds.dstSet = c->per_frame[i].descriptor_set;
+			wds.dstBinding = 0;
+			wds.dstArrayElement = 0;
+			vkUpdateDescriptorSets(c->device.handle, 1, &wds, 0, 0);
+		}
+
+    c->update_buffers = false;
   }
 
-  return true;
+	static auto stamp = std::chrono::steady_clock::now();
+	if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT)) {
+		auto n = std::chrono::steady_clock::now();
+		auto dif = std::chrono::duration_cast<std::chrono::milliseconds>(n - stamp);
+		if (dif.count() >= 100)
+			stamp = n;
+		else return true;
+
+		c->matrices.model =
+			glm::rotate(c->matrices.model, 0.2f, glm::vec3(1.f, 0.f, 0.f));
+		c->update_buffers = true;
+	}
+
+	return true;
 }
 
 bool submit(context *c, uint32_t frame_index, uint32_t image_index) {
@@ -168,9 +214,13 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
 
   vkCmdBeginRenderPass(rb, &rp_begin_info, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(rb, VK_PIPELINE_BIND_POINT_GRAPHICS, c->pipeline.handle);
+	vkCmdBindDescriptorSets(rb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			c->layout.handle, 0, 1, &c->per_frame[c->frame_index].descriptor_set,
+			0, 0);
 
   VkDeviceSize offset{0};
   vkCmdBindVertexBuffers(rb, 0, 1, &c->vertex_buffer.handle, &offset);
+	vkCmdBindIndexBuffer(rb, c->index_buffer.handle, 0, VK_INDEX_TYPE_UINT32);
 
   VkViewport viewport{};
   viewport.width = (float)c->window_width;
@@ -186,11 +236,7 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
   scissor.offset = {0, 0};
   vkCmdSetScissor(rb, 0, 1, &scissor);
 
-  const uint32_t vertex_count = c->vertices.size();
-  const uint32_t instance_count{1};
-  const uint32_t first_vertex{0};
-  const uint32_t first_instance{0};
-  vkCmdDraw(rb, vertex_count, instance_count, first_vertex, first_instance);
+	vkCmdDrawIndexed(rb, c->indices.size(), 1, 0, 0, 0);
   vkCmdEndRenderPass(rb);
 
   if (vkEndCommandBuffer(rb) != VK_SUCCESS) {
@@ -302,6 +348,16 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
+  if (!create_descriptor_pool(c)) {
+    l.loge("Descriptor creation failed\n");
+    return false;
+  }
+
+ 	if (!create_pipeline_layout(c)) {
+    l.loge("Failed to create pipeline layout\n");
+    return false;
+  }
+
   if (!create_pipeline(c)) {
     l.loge("Pipeline creation failed\n");
     return false;
@@ -312,7 +368,7 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
-  if (!create_command_buffers(c)) {
+  if (!create_buffers(c)) {
     l.loge("Command pool and buffer creation failed\n");
     return false;
   }
@@ -320,11 +376,12 @@ bool initialize(context *c, const fs::path bin,
   c->vertices = {{{0.0f, -0.5f, 0.f}, {1.0f, 0.0f, 0.0f, 1.f}},
                  {{0.5f, 0.5f, 0.f}, {0.0f, 1.0f, 0.0f, 1.f}},
                  {{-0.5f, 0.5f, 0.f}, {0.0f, 0.0f, 1.0f, 1.f}}};
-  c->update_vertex_buffer = true;
+  c->indices = {0,1,2};
+  c->update_buffers = true;
   return true;
 }
 
-bool create_vertex_buffer(context *c) {
+bool update_buffers(context *c) {
   auto &vb = c->vertex_buffer_create_info;
   auto a0 = c->allocator.handle;
   logger l{c->log_level};
@@ -342,19 +399,27 @@ bool create_vertex_buffer(context *c) {
       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
   VmaAllocationCreateInfo aci{};
-  VkBuffer buff{};
-  VmaAllocation alloc{};
-  VmaAllocationInfo ai{};
+  VkBuffer vbuf{}, ibuf{};
+  VmaAllocation valloc{}, ialloc{};
+  VmaAllocationInfo vai{}, iai{};
 
-  aci.usage = VMA_MEMORY_USAGE_AUTO;
+  aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
   aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 
-  if (vmaCreateBuffer(a0, &vb, &aci, &buff, &alloc, &ai) != VK_SUCCESS) {
+  if (vmaCreateBuffer(a0, &vb, &aci, &vbuf, &valloc, &vai) != VK_SUCCESS) {
     l.loge("Failed to create vk buffer using VMA\n");
     return false;
   }
+  c->vertex_buffer = raii::resource<adapter::vma_buffer>{a0, valloc, vbuf};
 
-  c->vertex_buffer = raii::resource<adapter::vma_buffer>{a0, alloc, buff};
+  vb.usage =
+      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (vmaCreateBuffer(a0, &vb, &aci, &ibuf, &ialloc, &iai) != VK_SUCCESS) {
+    l.loge("Failed to create vk buffer using VMA\n");
+    return false;
+  }
+  c->index_buffer = raii::resource<adapter::vma_buffer>{a0, ialloc, ibuf};
+
   return true;
 }
 
@@ -531,18 +596,87 @@ bool conf_color(VkPipelineColorBlendAttachmentState *state,
   return true;
 }
 
-bool create_layout(const VkDevice dev, VkPipelineLayout *layout) {
+bool create_descriptor_pool(context* c) {
+  logger l{c->log_level};
+	VkDescriptorPool handle{};
+	VkDescriptorPoolCreateInfo info{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+
+	VkDescriptorPoolSize size{};
+	size.descriptorCount = c->concurrent_frames;
+	size.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+
+	info.pPoolSizes = &size;
+	info.poolSizeCount = 1;
+	info.maxSets = c->concurrent_frames;
+
+	if (vkCreateDescriptorPool(c->device.handle,
+				&info, nullptr, &handle) != VK_SUCCESS) {
+		l.loge("Failed to create descriptor pool\n");
+		return false;
+	}
+	c->desc_pool = raii::resource<adapter::vk_descriptor_pool>{c->device.handle,
+		handle};
+
+	return true;
+}
+
+bool create_pipeline_layout(context* c) {
+  logger l{c->log_level};
+	const VkDevice dev = c->device.handle;
+	VkDescriptorSetLayoutBinding bi{};
+	bi.binding = 0;
+	bi.descriptorCount = 1;
+	bi.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	bi.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+	VkDescriptorSetLayoutCreateInfo li{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+	li.bindingCount = 1;
+	li.pBindings = &bi;
+
+	VkDescriptorSetLayout layout{};
+	if (vkCreateDescriptorSetLayout(c->device.handle, &li, nullptr, &layout)
+			!= VK_SUCCESS) {
+		l.loge("Failed to create descriptor set layout\n");
+		return false;
+	}
+	c->desc_layout = raii::resource<adapter::vk_descriptor_set_layout>{
+		c->device.handle, layout
+	};
+
   VkPipelineLayoutCreateInfo info{};
-  info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  info.setLayoutCount = 0;            // Optional
-  info.pSetLayouts = nullptr;         // Optional
-  info.pushConstantRangeCount = 0;    // Optional
-  info.pPushConstantRanges = nullptr; // Optional
+	VkPipelineLayout handle{};
 
-  if (vkCreatePipelineLayout(dev, &info, nullptr, layout) != VK_SUCCESS)
-    return false;
+	info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	info.setLayoutCount = 1;
+	info.pSetLayouts = &c->desc_layout.handle;
+	info.pushConstantRangeCount = 0;
+	info.pPushConstantRanges = nullptr;
 
-  return true;
+	if (vkCreatePipelineLayout(dev, &info, nullptr, &handle) != VK_SUCCESS)
+		return false;
+	c->layout = raii::resource<adapter::vk_pipeline_layout>{dev, handle};
+
+	std::vector<VkDescriptorSetLayout> layouts{};
+	for (std::size_t i = 0; i < c->concurrent_frames; ++i)
+		layouts.push_back(layout);
+
+	VkDescriptorSetAllocateInfo ai{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+	ai.descriptorPool = c->desc_pool.handle;
+	ai.descriptorSetCount = layouts.size();
+	ai.pSetLayouts = layouts.data();
+	std::array<VkDescriptorSet, context::concurrent_frames> descs{};
+
+	if (vkAllocateDescriptorSets(dev, &ai, descs.data()) != VK_SUCCESS) {
+		l.loge("Failed to allocate descriptor sets\n");
+		return false;
+	}	
+	for (std::size_t i = 0; i < c->concurrent_frames; ++i)
+		c->per_frame[i].descriptor_set = descs[i];
+
+	return true;
 }
 
 bool conf_vertex_input_info(VkPipelineVertexInputStateCreateInfo *info,
@@ -564,17 +698,9 @@ bool conf_vertex_input_info(VkPipelineVertexInputStateCreateInfo *info,
 bool create_pipeline(context *c) {
   logger l{c->log_level};
 
-  const VkDevice device = c->device.handle;
-  VkPipelineLayout layout{};
-  if (!create_layout(device, &layout)) {
-    l.loge("Failed to create pipeline layout\n");
-    return false;
-  }
-  c->layout = raii::resource<adapter::vk_pipeline_layout>{device, layout};
-
   raii::resource<adapter::vk_shader_module> modules[2];
   VkPipelineShaderStageCreateInfo shader_stages[2];
-  if (!conf_shaders(device, shader_stages, modules, c->log_level))
+  if (!conf_shaders(c->device.handle, shader_stages, modules, c->log_level))
     return false;
 
   VkPipelineViewportStateCreateInfo viewport_state{};
@@ -615,13 +741,13 @@ bool create_pipeline(context *c) {
   info.pDynamicState = &dynamic_state;
 
   VkPipeline handle{};
-  auto r = vkCreateGraphicsPipelines(device, 0, 1, &info, 0, &handle);
+  auto r = vkCreateGraphicsPipelines(c->device.handle, 0, 1, &info, 0, &handle);
   if (r != VK_SUCCESS) {
     l.loge("Failed to create pipeline with code: " + std::to_string(r), "\n");
     return false;
   }
 
-  c->pipeline = raii::resource<adapter::vk_pipeline>{device, handle};
+  c->pipeline = raii::resource<adapter::vk_pipeline>{c->device.handle, handle};
   return true;
 }
 
@@ -901,7 +1027,7 @@ bool create_semaphores(context *c) {
   return true;
 }
 
-bool create_command_buffers(context *c) {
+bool create_buffers(context *c) {
   logger l{c->log_level};
 
   VkCommandPool handle{VK_NULL_HANDLE};
@@ -959,6 +1085,31 @@ bool create_command_buffers(context *c) {
   for (std::size_t i = 0; i < c->concurrent_frames; ++i)
     c->per_frame[i].graphics_buffer = gbuffers[i];
 
+  auto vb = VkBufferCreateInfo{};
+  auto a0 = c->allocator.handle;
+  vb.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  vb.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  vb.size = sizeof(transformation);
+  vb.usage =
+      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  vb.usage =
+      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+  VmaAllocationCreateInfo aci{};
+  aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+  aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+
+	for (std::size_t i = 0; i < c->concurrent_frames; ++i) {
+		VmaAllocationInfo ai{};
+		VmaAllocation alloc{};
+		VkBuffer handle{};
+		if (vmaCreateBuffer(a0, &vb, &aci, &handle, &alloc, &ai) != VK_SUCCESS) {
+			l.loge("Failed to create descriptor buffer using VMA\n");
+			return false;
+		}
+		c->per_frame[i].desc_buffer = raii::resource<adapter::vma_buffer>{
+			a0, alloc, handle};
+	}
   return true;
 }
 
@@ -1218,6 +1369,7 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   const cfg::action_t d = [c, &debug_count](auto *, auto *, auto *) {
     c->debug = true;
     ++debug_count;
+		std::cout << "debugging enabled" << std::endl;
   };
 
   const cfg::action_t w = [c, &width_count](auto *, auto *, auto *s) {

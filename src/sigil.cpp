@@ -12,6 +12,7 @@ namespace fs = std::filesystem;
 
 namespace {
 bool initialize(context *, const fs::path, const std::vector<std::string>);
+void initialize_dynamic_state(context *c);
 bool parse_cli(context *c, const std::vector<std::string> *);
 bool initialize_glfw(context *c);
 bool create_instance(context *c);
@@ -42,6 +43,11 @@ bool find_supported_format(const std::vector<VkFormat> &candidates,
 
 bool render(context *c);
 bool update(context *c);
+
+using vtype = int;
+std::vector<vertex> normalize_matrix(const std::vector<std::vector<vtype>> &);
+bool configure_sigil_vertices(context *c);
+bool read_matrix(const std::string &, std::vector<std::vector<vtype>> *);
 } // namespace
 
 int main(int c, char **v) {
@@ -89,6 +95,35 @@ int main(int c, char **v) {
 }
 
 namespace {
+std::vector<vertex> normalize_matrix(const std::vector<std::vector<vtype>> &m) {
+  std::vector<vertex> out{};
+
+  struct sort_info {
+    std::size_t row, col;
+    vtype val;
+  };
+  std::vector<sort_info> ordered{};
+  for (std::size_t i = 0; i < m.size(); ++i)
+    for (std::size_t j = 0; j < m[i].size(); ++j)
+      ordered.push_back({i, j, m[i][j]});
+
+  std::sort(ordered.begin(), ordered.end(),
+            [](const auto &a, const auto &b) { return a.val < b.val; });
+
+  double depth_max{};
+  for (const auto &e : ordered)
+    if (e.val > depth_max)
+      depth_max = e.val;
+
+  for (auto &&e : ordered) {
+    out.push_back({.position = {e.col / double(m.size()) - 0.25,
+                                e.row / double(m.size()) - 0.25,
+                                double(e.val) / depth_max},
+                   .color = {1.f, 1.f, 0.f, 1.f}});
+  }
+  return out;
+}
+
 bool find_supported_format(const std::vector<VkFormat> &candidates,
                            const VkPhysicalDevice dev, VkImageTiling tiling,
                            VkFormatFeatureFlags features, VkFormat *out) {
@@ -197,6 +232,11 @@ void update_view(context *c) {
     c->matrices.model =
         glm::rotate(c->matrices.model, 0.2f, glm::vec3(1.f, 0.f, 0.f));
     c->update_buffers = true;
+  } else if (glfwGetKey(c->window.handle, GLFW_KEY_LEFT) == GLFW_PRESS &&
+             glfwGetKey(c->window.handle, GLFW_KEY_X) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, -0.2f, glm::vec3(1.f, 0.f, 0.f));
+    c->update_buffers = true;
   }
 
   else if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT) == GLFW_PRESS &&
@@ -204,12 +244,22 @@ void update_view(context *c) {
     c->matrices.model =
         glm::rotate(c->matrices.model, 0.2f, glm::vec3(0.f, 1.f, 0.f));
     c->update_buffers = true;
+  } else if (glfwGetKey(c->window.handle, GLFW_KEY_LEFT) == GLFW_PRESS &&
+             glfwGetKey(c->window.handle, GLFW_KEY_Y) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, -0.2f, glm::vec3(0.f, 1.f, 0.f));
+    c->update_buffers = true;
   }
 
   else if (glfwGetKey(c->window.handle, GLFW_KEY_RIGHT) == GLFW_PRESS &&
            glfwGetKey(c->window.handle, GLFW_KEY_Z) == GLFW_PRESS) {
     c->matrices.model =
         glm::rotate(c->matrices.model, 0.2f, glm::vec3(0.f, 0.f, 1.f));
+    c->update_buffers = true;
+  } else if (glfwGetKey(c->window.handle, GLFW_KEY_LEFT) == GLFW_PRESS &&
+             glfwGetKey(c->window.handle, GLFW_KEY_Z) == GLFW_PRESS) {
+    c->matrices.model =
+        glm::rotate(c->matrices.model, -0.2f, glm::vec3(0.f, 0.f, 1.f));
     c->update_buffers = true;
   }
 }
@@ -227,34 +277,35 @@ bool update(context *c) {
       return false;
     }
 
-    if (vmaCopyMemoryToAllocation(c->allocator.handle, c->indices.data(),
-                                  c->index_buffer.allocation, 0,
-					sizeof(decltype(c->indices)::value_type) * c->indices.size()) !=
-        VK_SUCCESS) {
-      l.loge("Failed to copy indices to buffer!\n");
-      return false;
-    }
+    /*
+if (vmaCopyMemoryToAllocation(c->allocator.handle, c->indices.data(),
+                      c->index_buffer.allocation, 0,
+                            sizeof(decltype(c->indices)::value_type) *
+c->indices.size()) != VK_SUCCESS) { l.loge("Failed to copy indices to
+buffer!\n"); return false;
+}
+    */
 
-		for (std::size_t i = 0; i < c->concurrent_frames; ++i) {
-			if (vmaCopyMemoryToAllocation(c->allocator.handle, &c->matrices,
-										c->per_frame[i].desc_buffer.allocation, 0,
-						sizeof(transformation)) != VK_SUCCESS) {
-				l.loge("Failed to copy matrices to buffer!\n");
-				return false;
-			}
+    for (std::size_t i = 0; i < c->concurrent_frames; ++i) {
+      if (vmaCopyMemoryToAllocation(c->allocator.handle, &c->matrices,
+                                    c->per_frame[i].desc_buffer.allocation, 0,
+                                    sizeof(transformation)) != VK_SUCCESS) {
+        l.loge("Failed to copy matrices to buffer!\n");
+        return false;
+      }
 
-			VkDescriptorBufferInfo dbi{.buffer = c->per_frame[i].desc_buffer.handle};
-			dbi.offset = 0;
-			dbi.range = VK_WHOLE_SIZE;
+      VkDescriptorBufferInfo dbi{.buffer = c->per_frame[i].desc_buffer.handle};
+      dbi.offset = 0;
+      dbi.range = VK_WHOLE_SIZE;
 
-			VkWriteDescriptorSet wds{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-			wds.descriptorCount = 1;
-			wds.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-			wds.pBufferInfo = &dbi;
-			wds.dstSet = c->per_frame[i].descriptor_set;
-			wds.dstBinding = 0;
-			wds.dstArrayElement = 0;
-			vkUpdateDescriptorSets(c->device.handle, 1, &wds, 0, 0);
+      VkWriteDescriptorSet wds{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      wds.descriptorCount = 1;
+      wds.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      wds.pBufferInfo = &dbi;
+      wds.dstSet = c->per_frame[i].descriptor_set;
+      wds.dstBinding = 0;
+      wds.dstArrayElement = 0;
+      vkUpdateDescriptorSets(c->device.handle, 1, &wds, 0, 0);
 		}
 
     c->update_buffers = false;
@@ -333,29 +384,30 @@ bool record(context *c, uint32_t frame_index, uint32_t image_index) {
   vkCmdBindVertexBuffers(rb, 0, 1, &c->vertex_buffer.handle, &offset);
 	vkCmdBindIndexBuffer(rb, c->index_buffer.handle, 0, VK_INDEX_TYPE_UINT32);
 
-  VkViewport viewport{};
-  viewport.width = (float)c->window_width;
-  viewport.height = (float)c->window_height;
-  viewport.minDepth = 0.0f;
-  viewport.maxDepth = 1.0f;
-  viewport.x = 0.0f;
-  viewport.y = 0.0f;
-  vkCmdSetViewport(rb, 0, 1, &viewport);
+        vkCmdSetViewport(rb, 0, 1, &c->viewport);
+        vkCmdSetScissor(rb, 0, 1, &c->scissor);
+        vkCmdDraw(rb, c->vertices.size(), 1, 0, 0);
+        // vkCmdDrawIndexed(rb, c->indices.size(), 1, 0, 0, 0);
+        vkCmdEndRenderPass(rb);
 
-  VkRect2D scissor{};
-  scissor.extent = {c->window_width, c->window_height};
-  scissor.offset = {0, 0};
-  vkCmdSetScissor(rb, 0, 1, &scissor);
-
-	vkCmdDrawIndexed(rb, c->indices.size(), 1, 0, 0, 0);
-  vkCmdEndRenderPass(rb);
-
-  if (vkEndCommandBuffer(rb) != VK_SUCCESS) {
-    l.loge("Failed to end command buffer\n");
-    return false;
+        if (vkEndCommandBuffer(rb) != VK_SUCCESS) {
+          l.loge("Failed to end command buffer\n");
+          return false;
   }
 
   return true;
+}
+
+void initialize_dynamic_state(context *c) {
+  c->viewport.width = (float)c->window_width;
+  c->viewport.height = (float)c->window_height;
+  c->viewport.minDepth = 0.0f;
+  c->viewport.maxDepth = 1.0f;
+  c->viewport.x = 0.0f;
+  c->viewport.y = 0.0f;
+
+  c->scissor.extent = {c->window_width, c->window_height};
+  c->scissor.offset = {0, 0};
 }
 
 bool render(context *c) {
@@ -396,6 +448,7 @@ bool render(context *c) {
 bool initialize(context *c, const fs::path bin,
                 const std::vector<std::string> cli) {
   fs::current_path(fs::absolute(bin.parent_path()));
+  initialize_dynamic_state(c);
   logger l{logger::err};
 
   if (!parse_cli(c, &cli)) {
@@ -489,10 +542,63 @@ bool initialize(context *c, const fs::path bin,
     return false;
   }
 
-  c->vertices = {{{0.0f, -0.5f, 0.f}, {1.0f, 0.0f, 0.0f, 1.f}},
-                 {{0.5f, 0.5f, 0.f}, {0.0f, 1.0f, 0.0f, 1.f}},
-                 {{-0.5f, 0.5f, 0.f}, {0.0f, 0.0f, 1.0f, 1.f}}};
-  c->indices = {0,1,2};
+  if (!configure_sigil_vertices(c)) {
+    l.loge("Failed to configure sigil\n");
+    return false;
+  }
+
+  return true;
+}
+
+bool read_matrix(const std::string &path, std::vector<std::vector<vtype>> *d) {
+  if (!d)
+    return false;
+
+  std::ifstream stream{path};
+  if (!stream.is_open())
+    return false;
+
+  std::vector<vtype> linear{};
+  vtype entry{};
+  while (true) {
+    stream >> entry;
+    if (stream.eof() || stream.bad())
+      break;
+    linear.push_back(entry);
+  }
+
+  if (stream.bad())
+    return false;
+
+  const double root = std::sqrt(linear.size());
+  const std::size_t trunc = root;
+  if (trunc * trunc != linear.size())
+    return false; // matrix is not square
+
+  d->resize(trunc);
+  for (std::size_t i = 0; i < d->size(); ++i)
+    (*d)[i].resize(trunc);
+
+  std::size_t row{}, col{};
+  for (std::size_t i = 0; i < linear.size(); ++i) {
+    (*d)[row][col++] = linear[i];
+    if (col == trunc) {
+      col = 0;
+      ++row;
+    }
+  }
+  return true;
+}
+
+bool configure_sigil_vertices(context *c) {
+  logger l{c->log_level};
+  std::vector<std::vector<vtype>> data{};
+  if (!read_matrix(c->matrix_source_file, &data)) {
+    l.loge("Failed to read matrix from source file\n");
+    return false;
+  }
+
+  c->vertices = normalize_matrix(data);
   c->update_buffers = true;
   return true;
 }
@@ -664,7 +770,7 @@ bool conf_assembly(VkPipelineInputAssemblyStateCreateInfo *a,
                    VkPipelineRasterizationStateCreateInfo *r,
                    VkPipelineMultisampleStateCreateInfo *m) {
   a->sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  a->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  a->topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
   a->primitiveRestartEnable = VK_FALSE;
 
   r->sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -678,10 +784,10 @@ bool conf_assembly(VkPipelineInputAssemblyStateCreateInfo *a,
   m->sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
   m->sampleShadingEnable = VK_FALSE;
   m->rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-  m->minSampleShading = 1.0f;          // Optional
-  m->pSampleMask = nullptr;            // Optional
-  m->alphaToCoverageEnable = VK_FALSE; // Optional
-  m->alphaToOneEnable = VK_FALSE;      // Optional
+  m->minSampleShading = 1.0f;
+  m->pSampleMask = nullptr;
+  m->alphaToCoverageEnable = VK_FALSE;
+  m->alphaToOneEnable = VK_FALSE;
   return true;
 }
 
@@ -1492,16 +1598,18 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   cfg::add_entry(&tbl, cfg::token_type::flag, "verbose-flag", "-v|--verbose");
   cfg::add_entry(&tbl, cfg::token_type::flag, "help-flag", "--help");
   cfg::add_entry(&tbl, cfg::token_type::flag, "debug-flag", "-d|--debug");
+  cfg::add_entry(&tbl, cfg::token_type::option, "file-option", "-f|--file");
   cfg::add_entry(&tbl, cfg::token_type::option, "width-option", "-w|--width");
   cfg::add_entry(&tbl, cfg::token_type::option, "height-option", "-h|--height");
   cfg::add_entry(&tbl, cfg::token_type::free, "size-tok", "[1-9]\\d{2,3}");
+  cfg::add_entry(&tbl, cfg::token_type::free, "string-tok", ".+");
 
   cfg::action_map_t m{};
   cfg::grammar_t g{};
-  cfg::action_t f{};
   logger l{};
 
-  unsigned verbose_count{}, debug_count{}, width_count{}, height_count{};
+  unsigned verbose_count{}, debug_count{}, width_count{}, height_count{},
+      file_count{};
 
   const cfg::action_t help = [c](auto *, auto *, auto *) { c->help = true; };
   const cfg::action_t v = [c, &verbose_count](auto *, auto *, auto *) {
@@ -1524,9 +1632,15 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
     ++height_count;
   };
 
+  const cfg::action_t f = [c, &file_count](auto *, auto *, auto *s) {
+    c->matrix_source_file = s->value;
+    ++file_count;
+  };
+
   bind(&m, add_rule(&g, "start", "help-flag"), help);
   bind(&m, add_rule(&g, "start", "verbose-flag"), v);
   bind(&m, add_rule(&g, "start", "debug-flag"), d);
+  bind(&m, add_rule(&g, "start", "file-option#0", "string-tok#0"), f);
   bind(&m, add_rule(&g, "start", "width-option#0", "size-tok#0"), w);
   bind(&m, add_rule(&g, "start", "height-option#0", "size-tok#0"), h);
 
@@ -1534,17 +1648,21 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   bind(&m, add_rule(&g, "arg_list", "debug-flag"), d);
   bind(&m, add_rule(&g, "arg_list", "width-option#0", "size-tok#0"), w);
   bind(&m, add_rule(&g, "arg_list", "height-option#0", "size-tok#0"), h);
+  bind(&m, add_rule(&g, "arg_list", "file-option#0", "string-tok#0"), f);
 
   bind(&m, add_rule(&g, "arg", "verbose-flag"), v);
   bind(&m, add_rule(&g, "arg", "debug-flag"), d);
   bind(&m, add_rule(&g, "arg", "width-option#0", "size-tok#0"), w);
   bind(&m, add_rule(&g, "arg", "height-option#0", "size-tok#0"), h);
+  bind(&m, add_rule(&g, "arg", "file-option#0", "string-tok#0"), f);
 
   add_rule(&g, "start", "arg", "arg_list");
   add_rule(&g, "arg_list", "arg", "arg_list");
   add_rule(&g, "width-option#0", "width-option");
   add_rule(&g, "size-tok#0", "size-tok");
+  add_rule(&g, "string-tok#0", "string-tok");
   add_rule(&g, "height-option#0", "height-option");
+  add_rule(&g, "file-option#0", "file-option");
 
   const auto tokens = cfg::tokenize(&tbl, input);
   const auto chart = cfg::cyk(&g, &tokens, &m);
@@ -1559,7 +1677,7 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   cfg::run_actions(&trees.front(), &m);
 
   if (verbose_count > 1 || debug_count > 1 || width_count > 1 ||
-      height_count > 1)
+      height_count > 1 || file_count > 1)
     return false;
 
   l = logger{c->log_level};
@@ -1568,6 +1686,7 @@ bool parse_cli(context *c, const std::vector<std::string> *input) {
   l.logs("\tdebug: ", c->debug ? "true" : "false", "\n");
   l.logs("\twindow width: ", c->window_width, "\n");
   l.logs("\twindow height: ", c->window_height, "\n");
+  l.logs("\tmatrix file: ", c->matrix_source_file, "\n");
 
   return true;
 }

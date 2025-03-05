@@ -13,3 +13,6 @@ find_package(glm REQUIRED)
 
 include_directories(include)
 add_subdirectory(src)
+
+file(GLOB_RECURSE matrix_files data/*)
+file(COPY ${matrix_files} DESTINATION ${CMAKE_BINARY_DIR}/)

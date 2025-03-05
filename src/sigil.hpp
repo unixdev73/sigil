@@ -56,8 +56,11 @@ struct context {
   static constexpr uint32_t concurrent_frames{2};
   uint32_t window_width{1280}, window_height{720};
   bool debug{false}, help{false};
+  std::string matrix_source_file{};
   std::size_t log_level{};
   VkApplicationInfo app_info{};
+  VkViewport viewport{};
+  VkRect2D scissor{};
 
   raii::resource<adapter::glfw_guard> glfw_guard{};
   raii::resource<adapter::vk_instance> instance{};
